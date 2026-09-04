@@ -1,0 +1,4 @@
+# The target Lambda uses only boto3, which is already provided by the AWS Lambda
+# Python runtime — so there are no packages to install. This file exists to
+# satisfy `sam build` and to document that intent. Pin boto3 here only if you
+# need a newer version than the runtime provides.

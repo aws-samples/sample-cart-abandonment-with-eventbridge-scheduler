@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Personalized cart re-engagement with Amazon EventBridge Scheduler (blog
+  sample). Deploys an end-to-end demo: the re-engagement target Lambda, the
+  cart-abandonment schedule group, a least-privilege IAM role that lets
+  EventBridge Scheduler invoke the function, a DynamoDB table for carts, and an
+  SNS topic for notification delivery. The scheduling operations in
+  src/scheduler_client.py create/delete schedules against these resources.
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 128
+    Runtime: python3.12
+
+Resources:
+  # Customer-managed KMS key (CMK) used to encrypt cart data at rest in DynamoDB
+  # and notification messages in SNS. A CMK (rather than an AWS-owned key) lets
+  # you control rotation and access, and satisfies encryption best practices.
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts the carts table and re-engagement topic for the sample.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  # DynamoDB table that stores carts (partition key: cart_id). Encrypted with the
+  # customer-managed CMK, with point-in-time recovery enabled.
+  CartsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cart_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cart_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+
+  # SNS topic that re-engagement notifications are published to. Subscribe an
+  # email or SMS endpoint to receive them. Encrypted with the CMK.
+  ReengagementTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # Dead-letter queue for the target Lambda: events that fail all retries land
+  # here instead of being lost. Encrypted with the same CMK.
+  ReengagementDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days (maximum)
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # The Lambda that EventBridge Scheduler invokes when a follow-up fires. It reads
+  # the cart from DynamoDB and publishes the notification to the SNS topic.
+  ReengagementTargetFunction:
+    Type: AWS::Serverless::Function
+    # checkov:skip=CKV_AWS_117:This sample intentionally runs the function outside
+    # a VPC. Placing it in a VPC would require VPC endpoints for DynamoDB, SNS,
+    # and KMS and adds networking complexity that is unnecessary for a public
+    # demo. Configure a VPC in your own environment if your data plane requires it.
+    Properties:
+      # No fixed FunctionName: let CloudFormation auto-name the function so the
+      # stack can be deployed more than once per account/Region without name
+      # collisions. Read the generated name from the ReengagementFunctionName output.
+      CodeUri: functions/reengagement_target/
+      Handler: app.lambda_handler
+      Description: Reads the cart from DynamoDB and publishes the notification to SNS.
+      # Cap concurrency so a burst of due follow-ups cannot exhaust the account's
+      # Lambda pool. Tune this to your expected volume.
+      ReservedConcurrentExecutions: 10
+      # Encrypt environment variables at rest with the customer-managed CMK.
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      # Failed invocations are sent to the dead-letter queue for inspection.
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt ReengagementDLQ.Arn
+      Environment:
+        Variables:
+          CARTS_TABLE: !Ref CartsTable
+          REENGAGEMENT_TOPIC_ARN: !Ref ReengagementTopic
+      Policies:
+        # Least-privilege: read a cart, publish to only this topic, use the CMK
+        # that encrypts everything, and send failed events to the DLQ. (SAM also
+        # adds sqs:SendMessage for the DeadLetterQueue target automatically.)
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt CartsTable.Arn
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref ReengagementTopic
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !GetAtt EncryptionKey.Arn
+
+  # Schedule group for cart-abandonment follow-ups.
+  CartAbandonmentGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: cart-abandonment
+
+  # Least-privilege role assumed by EventBridge Scheduler to invoke the target
+  # Lambda. It can invoke only this one function ARN.
+  SchedulerToLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeReengagementTarget
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ReengagementTargetFunction.Arn
+
+Outputs:
+  ReengagementFunctionArn:
+    Description: Set this as REENGAGEMENT_FUNCTION_ARN for src/scheduler_client.py.
+    Value: !GetAtt ReengagementTargetFunction.Arn
+  ReengagementFunctionName:
+    Description: Generated Lambda name (use for `aws logs tail /aws/lambda/<name>`).
+    Value: !Ref ReengagementTargetFunction
+  SchedulerRoleArn:
+    Description: Set this as SCHEDULER_ROLE_ARN for src/scheduler_client.py.
+    Value: !GetAtt SchedulerToLambdaRole.Arn
+  CartsTableName:
+    Description: Set this as CARTS_TABLE for the scheduling code.
+    Value: !Ref CartsTable
+  ReengagementTopicArn:
+    Description: Set this as REENGAGEMENT_TOPIC_ARN. Subscribe an endpoint to receive notifications.
+    Value: !Ref ReengagementTopic
+  CartAbandonmentGroupName:
+    Description: Schedule group for cart-abandonment follow-ups.
+    Value: !Ref CartAbandonmentGroup
