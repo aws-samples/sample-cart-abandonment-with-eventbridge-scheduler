@@ -43,7 +43,7 @@ pending schedule.
 | Path | Runs where | Blog snippet |
 |------|-----------|--------------|
 | `src/config.py` | client + Lambda | shared clients / ARNs / table / topic / group |
-| `src/scheduler_client.py` | your app / API backend | Schedule, Cancel, Multi-stage, Dynamic cancel |
+| `src/scheduler_client.py` | your app / API backend | Route, Schedule follow-up, Multi-stage, Cancel |
 | `src/handler.py` | delivery Lambda (per-customer, stubbed) | Delivering the notification |
 | `functions/reengagement_target/app.py` | deployed Lambda (SAM) | self-contained target (DynamoDB + SNS) |
 | `src/data_layer.py` | your app | DynamoDB/SNS reference impl + stubs |
@@ -171,9 +171,10 @@ demo path. To build the full personalized experience from the blog:
 3. **Deploy your real target** — replace the demo `functions/reengagement_target/`
    with `src/handler.py` (once its stubs are implemented) for full per-customer
    delivery, and redeploy.
-4. **Call the scheduling functions** from your application —
-   `on_cart_abandoned`, `on_purchase_completed`, `on_high_value_cart_abandoned`,
-   and the dynamic/multi-stage cancels.
+4. **Call the scheduling functions** from your application — route detected
+   abandonments through `handle_cart_abandonment` (which picks a single follow-up
+   or the multi-stage sequence), and call `on_purchase_completed` on conversion
+   to cancel all pending follow-ups for the cart.
 5. **Test and clean up** — see the sections above.
 
 ## Running the tests

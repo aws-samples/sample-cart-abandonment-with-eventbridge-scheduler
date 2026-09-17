@@ -1,9 +1,10 @@
 """Mocked tests proving the sample works as the blog describes.
 
 These tests use moto to mock EventBridge Scheduler, so no real AWS resources or
-credentials are touched. They verify each capability in the blog: schedule a
-personalized follow-up, the delay heuristic, cancel on conversion, multi-stage
-sequences, dynamic prefix cancel, the delivery handler, and cleanup.
+credentials are touched. They verify each capability in the blog: routing a
+detected abandonment, scheduling a personalized follow-up, the delay heuristic,
+multi-stage sequences, prefix-based cancel on conversion, the delivery handler,
+and cleanup.
 
 Run:  pytest -q
 """
@@ -106,9 +107,59 @@ def test_on_cart_abandoned_creates_schedule(modules):
 
 
 # --------------------------------------------------------------------------- #
-# on_purchase_completed
+# Routing — handle_cart_abandonment
 # --------------------------------------------------------------------------- #
-def test_cancel_on_conversion(modules):
+def test_router_low_value_single_followup(modules):
+    """Below threshold -> single follow-up schedule, no stages."""
+    sc = modules["sc"]
+    items = [{"product_id": "p", "price": 10.0, "quantity": 1}]  # value 10 < 200
+    sc.handle_cart_abandonment(
+        "c1", "cartLow", items, 700, "UTC", "email", "regular",
+    )
+    # single schedule exists
+    _get_schedule("cart-abandon-cartLow")
+    # no stage schedules
+    client = boto3.client("scheduler", region_name=REGION)
+    with pytest.raises(client.exceptions.ResourceNotFoundException):
+        client.get_schedule(Name="cart-abandon-cartLow-stage1", GroupName=GROUP)
+
+
+def test_router_high_value_multi_stage(modules):
+    """At/above threshold -> three stages, no single follow-up."""
+    sc = modules["sc"]
+    items = [{"product_id": "p", "price": 300.0, "quantity": 1}]  # value 300 >= 200
+    sc.handle_cart_abandonment(
+        "c1", "cartHigh", items, 700, "UTC", "email", "vip",
+    )
+    for suffix in ("stage1", "stage2", "stage3"):
+        sched = _get_schedule(f"cart-abandon-cartHigh-{suffix}")
+        assert sched["FlexibleTimeWindow"]["Mode"] == "OFF"
+    # no single-stage schedule for a high-value cart
+    client = boto3.client("scheduler", region_name=REGION)
+    with pytest.raises(client.exceptions.ResourceNotFoundException):
+        client.get_schedule(Name="cart-abandon-cartHigh", GroupName=GROUP)
+
+
+# --------------------------------------------------------------------------- #
+# Multi-stage sequences
+# --------------------------------------------------------------------------- #
+def test_high_value_creates_three_stages(modules):
+    sc = modules["sc"]
+    items = [{"product_id": "p", "price": 300.0, "quantity": 1}]
+    sc.on_high_value_cart_abandoned("c1", "cartHV", items, 700, "email", "regular")
+    for suffix in ("stage1", "stage2", "stage3"):
+        sched = _get_schedule(f"cart-abandon-cartHV-{suffix}")
+        assert sched["FlexibleTimeWindow"]["Mode"] == "OFF"
+        payload = json.loads(sched["Target"]["Input"])
+        assert payload["session_duration_seconds"] == 700
+        assert payload["channel_preference"] == "email"
+        assert payload["customer_segment"] == "regular"
+
+
+# --------------------------------------------------------------------------- #
+# on_purchase_completed (prefix-based cancel of single + all stages)
+# --------------------------------------------------------------------------- #
+def test_cancel_on_conversion_single(modules):
     sc = modules["sc"]
     sc.on_cart_abandoned("c1", "cart2", ITEMS, 700, "UTC", "email", "regular")
     sc.on_purchase_completed("c1", "cart2")
@@ -117,51 +168,19 @@ def test_cancel_on_conversion(modules):
         client.get_schedule(Name="cart-abandon-cart2", GroupName=GROUP)
 
 
-def test_cancel_when_absent_is_silent(modules):
-    modules["sc"].on_purchase_completed("c1", "never-existed")  # must not raise
-
-
-# --------------------------------------------------------------------------- #
-# Multi-stage sequences
-# --------------------------------------------------------------------------- #
-def test_high_value_creates_three_stages(modules):
-    sc = modules["sc"]
-    items = [{"product_id": "p", "price": 300.0, "quantity": 1}]  # value 300 >= 200
-    sc.on_high_value_cart_abandoned("c1", "cartHV", items)
-    for suffix in ("stage1", "stage2", "stage3"):
-        sched = _get_schedule(f"cart-abandon-cartHV-{suffix}")
-        assert sched["FlexibleTimeWindow"]["Mode"] == "OFF"
-
-
-def test_low_value_creates_no_stages(modules):
-    sc = modules["sc"]
-    items = [{"product_id": "p", "price": 10.0, "quantity": 1}]  # value 10 < 200
-    sc.on_high_value_cart_abandoned("c1", "cartLV", items)
-    client = boto3.client("scheduler", region_name=REGION)
-    with pytest.raises(client.exceptions.ResourceNotFoundException):
-        client.get_schedule(Name="cart-abandon-cartLV-stage1", GroupName=GROUP)
-
-
-def test_multi_stage_cancel_removes_all(modules):
+def test_cancel_on_conversion_removes_all_stages(modules):
     sc = modules["sc"]
     items = [{"product_id": "p", "price": 300.0, "quantity": 1}]
-    sc.on_high_value_cart_abandoned("c1", "cartHV2", items)
-    sc.on_purchase_completed_multi_stage("c1", "cartHV2")
+    sc.on_high_value_cart_abandoned("c1", "cartHV2", items, 700, "email", "regular")
+    sc.on_purchase_completed("c1", "cartHV2")
     remaining = boto3.client("scheduler", region_name=REGION).list_schedules(
         GroupName=GROUP
     )["Schedules"]
     assert [s for s in remaining if s["Name"].startswith("cart-abandon-cartHV2")] == []
 
 
-def test_dynamic_cancel_by_prefix(modules):
-    sc = modules["sc"]
-    items = [{"product_id": "p", "price": 300.0, "quantity": 1}]
-    sc.on_high_value_cart_abandoned("c1", "cartDyn", items)
-    sc.on_purchase_completed_dynamic("c1", "cartDyn")
-    remaining = boto3.client("scheduler", region_name=REGION).list_schedules(
-        GroupName=GROUP
-    )["Schedules"]
-    assert [s for s in remaining if s["Name"].startswith("cart-abandon-cartDyn")] == []
+def test_cancel_when_absent_is_silent(modules):
+    modules["sc"].on_purchase_completed("c1", "never-existed")  # must not raise
 
 
 # --------------------------------------------------------------------------- #

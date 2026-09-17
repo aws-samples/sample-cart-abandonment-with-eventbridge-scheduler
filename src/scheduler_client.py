@@ -1,15 +1,15 @@
 """Client-side scheduling operations for per-customer cart re-engagement.
 
 This module runs wherever your application detects cart abandonment and
-conversion (for example, behind your storefront API). It creates one-time
-EventBridge Scheduler schedules with a personalized delay, cancels them when a
-customer converts, and supports multi-stage follow-up sequences for high-value
-carts. The target Lambda that fires when a schedule is due lives in
+conversion (for example, behind your storefront API). It routes a detected
+abandonment to either a single personalized follow-up or a multi-stage sequence
+for high-value carts, and cancels all pending follow-ups when a customer
+converts. The target Lambda that fires when a schedule is due lives in
 src/handler.py. One-time teardown of leftover schedules lives in
 scripts/cleanup.py.
 
-Consolidated from blog snippets: schedule follow-up, cancel on conversion,
-multi-stage sequences, dynamic cancel.
+Consolidated from blog snippets: schedule follow-up, multi-stage sequences,
+cancel on conversion.
 """
 import json
 from datetime import datetime, timedelta, timezone
@@ -20,6 +20,32 @@ from src.config import (
     ROLE_ARN,
     scheduler,
 )
+
+# Carts at or above this value get a multi-stage follow-up sequence.
+HIGH_VALUE_THRESHOLD = 200
+
+
+def handle_cart_abandonment(customer_id: str, cart_id: str, cart_items: list,
+                            session_duration_seconds: int, customer_timezone: str,
+                            channel_preference: str, customer_segment: str):
+    """Route a detected cart abandonment to the appropriate follow-up strategy.
+
+    High-value carts receive a multi-stage sequence; all others receive a
+    single personalized follow-up. A cart is scheduled through exactly one path.
+    """
+    cart_value = sum(item["price"] * item["quantity"] for item in cart_items)
+
+    if cart_value >= HIGH_VALUE_THRESHOLD:
+        on_high_value_cart_abandoned(
+            customer_id, cart_id, cart_items,
+            session_duration_seconds, channel_preference, customer_segment,
+        )
+    else:
+        on_cart_abandoned(
+            customer_id, cart_id, cart_items,
+            session_duration_seconds, customer_timezone,
+            channel_preference, customer_segment,
+        )
 
 
 def on_cart_abandoned(customer_id: str, cart_id: str, cart_items: list,
@@ -73,24 +99,10 @@ def calculate_optimal_delay(session_duration: int, segment: str,
     return 120  # Low intent / casual browse
 
 
-def on_purchase_completed(customer_id: str, cart_id: str):
-    """Cancel the abandonment follow-up when the customer converts."""
-    try:
-        scheduler.delete_schedule(
-            Name=f"cart-abandon-{cart_id}",
-            GroupName=CART_ABANDONMENT_GROUP,
-        )
-    except scheduler.exceptions.ResourceNotFoundException:
-        pass  # Follow-up already fired or was never scheduled
-
-
 def on_high_value_cart_abandoned(customer_id: str, cart_id: str,
-                                 cart_items: list):
+                                 cart_items: list, session_duration_seconds: int,
+                                 channel_preference: str, customer_segment: str):
     """Create a multi-stage follow-up sequence for high-value carts."""
-    cart_value = sum(item["price"] * item["quantity"] for item in cart_items)
-    if cart_value < 200:
-        return
-
     stages = [
         {"delay_minutes": 30, "stage": "gentle_reminder", "suffix": "stage1"},
         {"delay_minutes": 240, "stage": "social_proof", "suffix": "stage2"},
@@ -115,28 +127,21 @@ def on_high_value_cart_abandoned(customer_id: str, cart_id: str,
                     "customer_id": customer_id,
                     "cart_id": cart_id,
                     "cart_items": cart_items,
+                    "session_duration_seconds": session_duration_seconds,
+                    "channel_preference": channel_preference,
+                    "customer_segment": customer_segment,
                 }),
             },
         )
 
 
-def on_purchase_completed_multi_stage(customer_id: str, cart_id: str):
-    """Cancel all pending follow-up stages on conversion."""
-    for suffix in ["stage1", "stage2", "stage3"]:
-        try:
-            scheduler.delete_schedule(
-                Name=f"cart-abandon-{cart_id}-{suffix}",
-                GroupName=CART_ABANDONMENT_GROUP,
-            )
-        except scheduler.exceptions.ResourceNotFoundException:
-            pass
+def on_purchase_completed(customer_id: str, cart_id: str):
+    """Cancel every pending follow-up for this cart when the customer converts.
 
-
-def on_purchase_completed_dynamic(customer_id: str, cart_id: str):
-    """Cancel all pending stages using a name prefix filter.
-
-    For dynamic sequences where the number of stages varies per customer
-    segment, discover and delete all related schedules by name prefix.
+    Uses a NamePrefix filter so it cancels both the single-stage schedule
+    (cart-abandon-{cart_id}) and any multi-stage schedules
+    (cart-abandon-{cart_id}-stage1, -stage2, ...), regardless of which
+    scheduling path created them.
     """
     prefix = f"cart-abandon-{cart_id}"
     paginator = scheduler.get_paginator("list_schedules")
@@ -148,4 +153,4 @@ def on_purchase_completed_dynamic(customer_id: str, cart_id: str):
                     GroupName=CART_ABANDONMENT_GROUP,
                 )
             except scheduler.exceptions.ResourceNotFoundException:
-                pass
+                pass  # Already fired or deleted concurrently
